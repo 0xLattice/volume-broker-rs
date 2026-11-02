@@ -1,0 +1,14 @@
+[package]
+name = "lattice-volume-broker"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+[dependencies]
+lattice-cashew = {path = "../cashew-rs"}
+rusqlite = {version = "0.38", features = ["bundled"]}
+thiserror = "2"
+tokio = {version = "1", features = ["rt", "sync", "macros"]}
+async-trait = "0.1"
+[dev-dependencies]
+serde = {version = "1", features = ["derive"]}
+tempfile = "3"
