@@ -9,7 +9,7 @@ mod asynchronous;
 mod disk;
 mod memory;
 pub use asynchronous::AsyncBroker;
-pub use disk::DiskBroker;
+pub use disk::{DiskBroker, DiskReadSnapshot};
 pub use memory::MemoryBroker;
 pub type Entries = BTreeMap<String, Vec<u8>>;
 pub type Roots = BTreeSet<String>;

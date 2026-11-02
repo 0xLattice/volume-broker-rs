@@ -106,6 +106,25 @@ impl DiskBroker {
             reader: Mutex::new(reader),
         })
     }
+    /// A stable local content view. BEGIN alone is deferred; the first SELECT
+    /// fixes the WAL end mark before returning, even before the first fetch.
+    /// Dropping the snapshot releases its read transaction. Writers continue;
+    /// callers must bound snapshot count/lifetime to bound retained WAL history.
+    pub fn read_snapshot(&self) -> Result<DiskReadSnapshot, Error> {
+        let reader = self.reader.lock().unwrap();
+        let path = reader
+            .path()
+            .ok_or(Error::InconsistentState("missing database path"))?;
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-1024; BEGIN DEFERRED;")?;
+        let _: Option<String> = db
+            .query_row("SELECT cid FROM cas_data LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        Ok(DiskReadSnapshot {
+            reader: Mutex::new(db),
+        })
+    }
     /// Fold committed WAL pages into the database; stores are already durable without it.
     pub fn checkpoint(&self) -> Result<(), Error> {
         self.connection
@@ -255,28 +274,7 @@ impl VolumeBroker for DiskBroker {
             .flatten()
     }
     fn fetch_data_local(&self, cids: &Roots) -> Entries {
-        fn load(db: &Connection, cids: &Roots) -> Result<Entries, Error> {
-            let mut found = Entries::new();
-            let ordered: Vec<_> = cids.iter().collect();
-            for chunk in ordered.chunks(500) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let sql = format!(
-                    "SELECT cd.cid,cd.data FROM cas_data cd WHERE cd.cid IN ({placeholders}) AND EXISTS (SELECT 1 FROM volume_entries owner JOIN volume_metadata vm ON vm.root=owner.root WHERE owner.cid=cd.cid AND {COMPLETE})"
-                );
-                let mut stmt = db.prepare(&sql)?;
-                let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-                })?;
-                for row in rows {
-                    let (cid, data) = row?;
-                    if validate_entry(&cid, &data).is_ok() {
-                        found.insert(cid, data);
-                    }
-                }
-            }
-            Ok(found)
-        }
-        load(&self.reader.lock().unwrap(), cids).unwrap_or_default()
+        load_entries(&self.reader.lock().unwrap(), cids).unwrap_or_default()
     }
     fn store_volumes_local(&self, volumes: &[SerializedVolume]) -> Result<(), Error> {
         let (memberships, content) = validate_batch(volumes)?;
@@ -395,6 +393,39 @@ impl RetainedRootBroker for DiskBroker {
         Ok(removed)
     }
 }
+
+fn load_entries(db: &Connection, cids: &Roots) -> Result<Entries, Error> {
+    let mut found = Entries::new();
+    let ordered: Vec<_> = cids.iter().collect();
+    for chunk in ordered.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT cd.cid,cd.data FROM cas_data cd WHERE cd.cid IN ({placeholders}) AND EXISTS (SELECT 1 FROM volume_entries owner JOIN volume_metadata vm ON vm.root=owner.root WHERE owner.cid=cd.cid AND {COMPLETE})"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (cid, data) = row?;
+            if validate_entry(&cid, &data).is_ok() {
+                found.insert(cid, data);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Read-only WAL lease; no content or authority is synthesized by this view.
+pub struct DiskReadSnapshot {
+    reader: Mutex<Connection>,
+}
+impl DiskReadSnapshot {
+    pub fn fetch_data(&self, cids: &Roots) -> Result<Entries, Error> {
+        load_entries(&self.reader.lock().unwrap(), cids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

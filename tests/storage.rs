@@ -380,3 +380,45 @@ fn replay_identical_batches_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     exercise(&DiskBroker::open(dir.path().join("db")).unwrap());
 }
+
+#[test]
+fn wal_snapshot_survives_release_and_excludes_later_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let broker = Arc::new(DiskBroker::open(directory.path().join("snapshot.db")).unwrap());
+    let before = volume("before", b"old shared");
+    let after = volume("after", b"new shared");
+    broker
+        .store_volumes_local(std::slice::from_ref(&before))
+        .unwrap();
+    broker
+        .merge_retained_roots("held", &roots(&[&before]))
+        .unwrap();
+    // Establish the snapshot before any fetch, not lazily at the first fetch.
+    let snapshot = broker.read_snapshot().unwrap();
+    let writer = broker.clone();
+    let old = before.clone();
+    let new = after.clone();
+    std::thread::spawn(move || {
+        writer
+            .release_retained_roots("held", &roots(&[&old]))
+            .unwrap();
+        writer.store_volumes_local(&[new]).unwrap();
+    })
+    .join()
+    .unwrap();
+    assert!(!broker.has_volume(&before.root));
+    assert!(broker.has_volume(&after.root));
+    assert_eq!(
+        snapshot
+            .fetch_data(&before.entries.keys().cloned().collect())
+            .unwrap(),
+        before.entries
+    );
+    assert!(snapshot.fetch_data(&roots(&[&after])).unwrap().is_empty());
+    let fresh = broker.read_snapshot().unwrap();
+    assert!(fresh.fetch_data(&roots(&[&before])).unwrap().is_empty());
+    drop(fresh);
+    drop(snapshot);
+    // With leases released the WAL can be fully checkpointed again.
+    broker.checkpoint().unwrap();
+}

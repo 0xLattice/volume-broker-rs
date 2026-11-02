@@ -32,3 +32,11 @@ Reviewed `0xLattice/lattice-formal` revision `a9f4c2879b6565ae11c17d35efe14475c5
 | Crash loses volatile state, keeps durable prefix | Abrupt subprocess exit with both committed WAL and uncommitted dirty changes; reopen preserves committed volume and retained scope and discards uncommitted updates | Process-exit recovery is not an electrical power-loss test |
 
 The model requires a durable revision floor. A count of durable fact batches is **not** a count of volumes or retained roots and must not be inferred from this broker. Child-level revision bumps without facts remain a model limitation documented upstream. CAS publication and named-root retention are separate transactions by the original API; a host must coordinate sweep against its own store/retain transition. This crate does not silently invent a cross-database transaction or node mutation lease.
+
+A local `DiskReadSnapshot` now supplies a scoped, authenticated complete-volume
+view fixed at creation using a SQLite WAL read transaction. Concurrent writers
+and retention deletion proceed while that view remains readable. Its caller must
+bound snapshot concurrency and lifetime: each connection has a 1 MiB page-cache
+target, but retained WAL history has no independent byte cap. The node uses this
+as the immutable content lease for bounded root-preflight workers. A real
+concurrent-writer test covers deletion, later writes, fresh views and release.
