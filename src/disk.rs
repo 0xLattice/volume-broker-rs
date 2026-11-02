@@ -110,6 +110,46 @@ impl DiskBroker {
     /// fixes the WAL end mark before returning, even before the first fetch.
     /// Dropping the snapshot releases its read transaction. Writers continue;
     /// callers must bound snapshot count/lifetime to bound retained WAL history.
+    /// Stable lexicographic page of one scope, without loading its full set.
+    pub fn retained_roots_page(
+        &self,
+        scope: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Roots, Error> {
+        let db = self.reader.lock().unwrap();
+        Ok(db
+            .prepare(
+                "SELECT root FROM retained_roots WHERE scope=?1 AND root>?2 ORDER BY root LIMIT ?3",
+            )?
+            .query_map(params![scope, after, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+    /// Page the union of scopes sharing an exact byte prefix.
+    pub fn retained_prefix_roots_page(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Roots, Error> {
+        // Prefixes here are protocol/storage scope strings. Compute a Unicode
+        // scalar successor to use the scope primary-key range, not a table scan.
+        let mut upper = prefix.to_owned();
+        let mut last = upper
+            .pop()
+            .ok_or(Error::InconsistentState("empty scope prefix"))? as u32;
+        last += 1;
+        if (0xd800..=0xdfff).contains(&last) {
+            last = 0xe000;
+        }
+        let last = char::from_u32(last)
+            .ok_or(Error::InconsistentState("scope prefix has no successor"))?;
+        upper.push(last);
+        let db = self.reader.lock().unwrap();
+        Ok(db.prepare("SELECT DISTINCT root FROM retained_roots WHERE scope>=?1 AND scope<?2 AND root>?3 ORDER BY root LIMIT ?4")?
+            .query_map(params![prefix, upper, after, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
     pub fn read_snapshot(&self) -> Result<DiskReadSnapshot, Error> {
         let reader = self.reader.lock().unwrap();
         let path = reader
@@ -421,6 +461,26 @@ pub struct DiskReadSnapshot {
     reader: Mutex<Connection>,
 }
 impl DiskReadSnapshot {
+    pub fn fetch_volume(&self, root: &str) -> Result<Option<SerializedVolume>, Error> {
+        load_volume(&self.reader.lock().unwrap(), root)
+    }
+    /// Return an authenticated complete owner of readable CID bytes, even if
+    /// the CID is not itself a stored Volume boundary. Never invent a manifest.
+    pub fn fetch_covering_volume(&self, cid: &str) -> Result<Option<SerializedVolume>, Error> {
+        let db = self.reader.lock().unwrap();
+        let sql = format!(
+            "SELECT vm.root FROM volume_entries owner JOIN volume_metadata vm ON vm.root=owner.root WHERE owner.cid=?1 AND {COMPLETE} ORDER BY vm.root"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let mut rows = stmt.query([cid])?;
+        while let Some(row) = rows.next()? {
+            let root: String = row.get(0)?;
+            if let Some(volume) = load_volume(&db, &root)? {
+                return Ok(Some(volume));
+            }
+        }
+        Ok(None)
+    }
     pub fn fetch_data(&self, cids: &Roots) -> Result<Entries, Error> {
         load_entries(&self.reader.lock().unwrap(), cids)
     }
